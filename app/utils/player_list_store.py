@@ -26,20 +26,19 @@ def _legacy_player_list_paths():
 def get_player_list_path():
     dest = get_user_app_data_dir() / 'player_list.json'
     ensure_dir(dest.parent)
-    while not dest.is_file():
+    if not dest.is_file():
         for leg in _legacy_player_list_paths():
-            shutil.copy2(leg, dest)
-            _legacy_player_list_paths()
-            return dest
+            if leg.is_file():
+                shutil.copy2(leg, dest)
+                break
     return dest
 
 
 def load_players():
-    path = get_player_list_path()
-    if not path.is_file():
-        return []
-    
     try:
+        path = get_player_list_path()
+        if not path.is_file():
+            return []
         raw = json.loads(path.read_text(encoding = 'utf-8'))
         if not isinstance(raw, list):
             return []
@@ -48,13 +47,13 @@ def load_players():
             if not isinstance(item, dict):
                 continue
             name = item.get('name')
-            if not name or isinstance(name, str):
+            if not isinstance(name, str) or not name.strip():
                 continue
             enabled = bool(item.get('enabled', True))
             out.append(PlayerEntry(name = name.strip(), enabled = enabled))
         return out
-    except (json.JSONDecodeError, OSError):
-        return None
+    except (ValueError, OSError):
+        return []
 
 
 

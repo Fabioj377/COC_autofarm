@@ -11,6 +11,12 @@ from app.config import ASPECT_BASELINE, ASPECT_16_10, ASPECT_16_9, Config, resol
 from app.utils.common import ensure_dir, get_resource_path, get_template_path
 from app.utils.logger import setup_logger
 
+# PNGs used at their on-disk pixel size in every aspect profile. All other
+# templates retain reference-resolution scaling. Add names only after validation.
+NATIVE_SCALE_TEMPLATES = {
+    'attack.png',
+}
+
 try:
     import pytesseract
     logger = setup_logger('VisionService')
@@ -136,8 +142,10 @@ try:
 
         
         @staticmethod
-        def _resize_template_for_screen(template, screen_img):
+        def _resize_template_for_screen(template, screen_img, template_name = None):
             '''Resize reference PNG templates to match the current capture.'''
+            if template_name in NATIVE_SCALE_TEMPLATES:
+                return template
             (sx, sy) = VisionService._template_scale_xy(screen_img)
             if abs(sx - 1) < 0.001 and abs(sy - 1) < 0.001:
                 return template
@@ -195,7 +203,7 @@ Returns (center_x, center_y) or (None, None).
                     logger.error(f'''Template not found: {template_path}''')
                     return (None, None)
                 if scale_template:
-                    template = VisionService._resize_template_for_screen(template, screen_img)
+                    template = VisionService._resize_template_for_screen(template, screen_img, template_name)
                 if region:
                     (x, y, w, h) = region
                     (h_screen, w_screen) = screen_img.shape[:2]
@@ -230,24 +238,42 @@ Returns (center_x, center_y) or (None, None).
 
         
         @staticmethod
-        def find_template_with_confidence(screen_img, template_name, threshold = 0, region = None):
+        def find_template_with_confidence(screen_img, template_name, threshold = 0, region = None, *, scale_template = True, diagnostics = None, force_reference_scale = False):
             '''
 Finds a template and returns (center_x, center_y, confidence).
 Confidence is 0.0-1.0 from cv2.matchTemplate TM_CCOEFF_NORMED.
 Returns (None, None, confidence) if not found above threshold.
+``force_reference_scale`` bypasses the native list for diagnostic comparisons only.
 '''
             
             try:
                 template_path = str(get_template_path(template_name))
+                if diagnostics is not None:
+                    cfg = Config()
+                    diagnostics.update(path = template_path, profile = cfg.aspect_key,
+                                       reference = (cfg.ref_width, cfg.ref_height),
+                                       capture = (screen_img.shape[1], screen_img.shape[0]),
+                                       region = region or (0, 0, screen_img.shape[1], screen_img.shape[0]),
+                                       original = None, scaled = None, error = None)
                 template = cv2.imread(template_path)
                 if template is None:
+                    if diagnostics is not None:
+                        diagnostics['error'] = 'template unreadable'
                     logger.error(f'''Template not found: {template_path}''')
                     return (None, None, 0)
-                template = VisionService._resize_template_for_screen(template, screen_img)
+                if diagnostics is not None:
+                    diagnostics['original'] = (template.shape[1], template.shape[0])
+                if scale_template:
+                    template = VisionService._resize_template_for_screen(
+                        template, screen_img, None if force_reference_scale else template_name)
+                if diagnostics is not None:
+                    diagnostics['scaled'] = (template.shape[1], template.shape[0])
                 if region:
                     (x, y, w, h) = region
                     (h_screen, w_screen) = screen_img.shape[:2]
                     if x + w > w_screen or y + h > h_screen:
+                        if diagnostics is not None:
+                            diagnostics['error'] = 'region out of bounds'
                         return (None, None, 0)
                     search_img = screen_img[y:y + h, x:x + w]
                     (offset_x, offset_y) = (x, y)  # [fix: x/y offsets were swapped -> every region search returned wrong coords]
@@ -257,6 +283,8 @@ Returns (None, None, confidence) if not found above threshold.
                 (t_h, t_w) = template.shape[:2]
                 (s_h, s_w) = search_img.shape[:2]
                 if t_w > s_w or t_h > s_h:
+                    if diagnostics is not None:
+                        diagnostics['error'] = 'template larger than search region'
                     return (None, None, 0)
                 result = cv2.matchTemplate(search_img, template, cv2.TM_CCOEFF_NORMED)
                 (_, max_val, _, max_loc) = cv2.minMaxLoc(result)
@@ -265,14 +293,46 @@ Returns (None, None, confidence) if not found above threshold.
                 center_x = offset_x + max_loc[0] + t_w // 2
                 center_y = offset_y + max_loc[1] + t_h // 2
                 return (center_x, center_y, float(max_val))
-            except Exception:
-                e = None
-                logger.error(f'''Error in find_template_with_confidence: {e}''')
-                e = None
-                del e
+            except Exception as e:
+                if diagnostics is not None:
+                    diagnostics['error'] = str(e)
+                logger.error('Error in find_template_with_confidence: %s', e)
                 return (None, None, 0)
-                e = None
-                del e
+
+        @staticmethod
+        def log_template_diagnostics(screen_img, template_name, region = None, *, best_score = None):
+            '''Failure-only diagnostics. Native-size matching is evidence, never a click fallback.'''
+            if screen_img is None or screen_img.size == 0:
+                logger.warning('Template diagnostic %s: capture unavailable; score/dimensions unavailable', template_name)
+                return
+            info = {}
+            _, _, scaled_score = VisionService.find_template_with_confidence(
+                screen_img, template_name, region = region, diagnostics = info,
+                force_reference_scale = True)
+            native_info = {}
+            _, _, unscaled_score = VisionService.find_template_with_confidence(
+                screen_img, template_name, region = region, scale_template = False,
+                diagnostics = native_info)
+            native = template_name in NATIVE_SCALE_TEMPLATES
+            score = unscaled_score if native else scaled_score
+            used = native_info.get('scaled') if native else info.get('scaled')
+            logger.warning(
+                'Template diagnostic %s: best_score=%s scaled_score=%.4f unscaled_score=%.4f '
+                'original=%s scaled=%s used=%s mode=%s capture=%s region=%s profile=%s '
+                'reference=%s path=%s scaled_error=%s unscaled_error=%s',
+                template_name, best_score if best_score is not None else score, scaled_score, unscaled_score,
+                info.get('original'), info.get('scaled'), used, 'native' if native else 'reference',
+                info.get('capture'), info.get('region'), info.get('profile'), info.get('reference'),
+                info.get('path'), info.get('error'), native_info.get('error'))
+            if (not native and info.get('error') is None and native_info.get('error') is None
+                    and scaled_score < 0.8 and unscaled_score >= 0.8
+                    and info.get('capture') == (1920, 1080)
+                    and info.get('reference') == (2560, 1440)):
+                logger.warning(
+                    'Possible native-scale template %s: unscaled_score=%.4f scaled_score=%.4f; '
+                    'PNG may originate from 1920x1080 instead of reference 2560x1440. '
+                    'Origin cannot be inferred from dimensions alone; no automatic correction.',
+                    template_name, unscaled_score, scaled_score)
 
 
         
@@ -298,7 +358,7 @@ Returns (None, None, confidence) if not found above threshold.
                 if template is None:
                     logger.error(f'''Template not found: {template_path}''')
                     return (0, None, None)
-                template = VisionService._resize_template_for_screen(template, screen_img)
+                template = VisionService._resize_template_for_screen(template, screen_img, template_name)
                 if region:
                     (x, y, w, h) = region
                     (h_screen, w_screen) = screen_img.shape[:2]
@@ -589,7 +649,7 @@ Best ``cv2.matchTemplate`` match: ``(left, top, t_w, t_h, score)``.
                 if template is None:
                     logger.error(f'''Template not found: {template_path}''')
                     return (None, None, None, None, 0)
-                template = VisionService._resize_template_for_screen(template, screen_img)
+                template = VisionService._resize_template_for_screen(template, screen_img, template_name)
                 if region:
                     (x, y, w, h) = region
                     (h_screen, w_screen) = screen_img.shape[:2]
@@ -633,7 +693,7 @@ Best ``cv2.matchTemplate`` match: ``(left, top, t_w, t_h, score)``.
                 if template is None:
                     logger.error(f'''Template not found: {template_path}''')
                     return []
-                template = VisionService._resize_template_for_screen(template, screen_img)
+                template = VisionService._resize_template_for_screen(template, screen_img, template_name)
                 if region:
                     (x, y, w, h) = region
                     (h_screen, w_screen) = screen_img.shape[:2]

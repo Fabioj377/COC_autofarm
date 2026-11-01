@@ -789,6 +789,9 @@ deselect, which would eat the upcoming Attack click.'''
     def _wait_for_attack_with_nudge(self, timeout = 10, error = True):
         '''Poll bottom-half ``attack.png``; dismiss ``okay`` / ``exit`` popups first; else empty + scroll.'''
         start = time.time()
+        best_score = None
+        best_frame = None
+        best_region = None
         while time.time() - start < timeout:
             self._check_stop()
             frame = self.window.screenshot()
@@ -808,7 +811,10 @@ deselect, which would eat the upcoming Attack click.'''
                 logger.warning('Attack wait: live battle detected (surrender visible) — leaving it to recovery')
                 return (None, None)
             search_region = self._search_region_for_template(frame, 'attack.png', None, None, 200)
-            (ax, ay) = self.vision.find_template(frame, 'attack.png', region = search_region)
+            (ax, ay, score) = self.vision.find_template_with_confidence(
+                frame, 'attack.png', threshold = 0.8, region = search_region)
+            if best_score is None or score > best_score:
+                best_score, best_frame, best_region = score, frame, search_region
             if ax:
                 return (ax, ay)
             self._nudge_view_to_reveal_attack()
@@ -816,6 +822,8 @@ deselect, which would eat the upcoming Attack click.'''
                 return (None, None)
         if error:
             logger.warning('Timeout waiting for attack.png')  # [recovered: decompiler misnested this inside the loop — it spammed once per poll]
+            self.vision.log_template_diagnostics(
+                best_frame, 'attack.png', region = best_region, best_score = best_score)
         return (None, None)
 
     
@@ -1473,12 +1481,21 @@ Returns (``"return"`` | ``"chest"``, x, y) or (None, None, None) on timeout.
                         return None
                     continue
             top_roi = VisionService.top_half_region(frame)
-            (hx, hy) = self._find_home_village_builder(frame, top_roi)
-            if hx:
+            for name, label in (('builder.png', 'builder'), ('gbuilder.png', 'goblin builder')):
+                (hx, hy) = self.vision.find_template(frame, name, threshold = 0.8, region = top_roi)
+                if hx:
+                    self._reload_first_seen = None
+                    logger.info('Recovery: Home Village confirmed via %s', label)
+                    return None
+            (ax, ay) = self.vision.find_template(
+                frame, 'attack.png', threshold = 0.8, region = VisionService.bottom_half_region(frame))
+            if ax:
                 self._reload_first_seen = None
+                logger.info('Recovery: Home Village confirmed via attack button')
                 return None
-            if not self.stop_event.wait(1):
-                continue
+            if self.stop_event.wait(1):
+                return None
+        logger.warning('Recovery: Home Village not confirmed after 20 attempts; continuing')
         return None
 
     
@@ -1571,6 +1588,7 @@ Each iteration dismisses ``okay.png`` / ``exit.png`` if present, then village / 
         '''Return ``"home"``, ``"builder"``, or ``None`` from top-half builder portraits.'''
         if frame is None:
             frame = self.window.screenshot()
+        self._village_detection_frame = frame
         if frame is None or frame.size == 0:
             return None
         self._update_config_size(frame)
@@ -1603,10 +1621,29 @@ Each iteration dismisses ``okay.png`` / ``exit.png`` if present, then village / 
     def _ensure_correct_village(self, builder_base):
         '''Before farming: switch villages if the wrong builder portrait is showing.'''
         self._check_stop()
+        frame = self.window.screenshot()
+        if frame is None or frame.size == 0:
+            raise RuntimeError('Game capture unavailable at startup; no input sent')
+        self._update_config_size(frame)
+        self._check_stop()
         self.input.click(pause = 0.15, *self.config.get_point('empty'))
         if self.stop_event.wait(0.2):
             return None
-        village = self._detect_village_type()
+        village = None
+        self._village_detection_frame = None
+        for attempt in range(3):
+            self._check_stop()
+            village = self._detect_village_type()
+            if village is not None:
+                break
+            if attempt < 2 and self.stop_event.wait(0.3):
+                return None
+        self._check_stop()
+        if village is None:
+            frame = self._village_detection_frame
+            region = VisionService.top_half_region(frame) if frame is not None and frame.size else None
+            for name in ('mbuilder.png', *_HOME_VILLAGE_BUILDER_TEMPLATES):
+                self.vision.log_template_diagnostics(frame, name, region = region)
         if builder_base:
             if village == 'builder':
                 return None
@@ -1885,6 +1922,7 @@ OCR is limited to the right half of the window unless ``region`` is passed expli
     
     def _wait_for_image(self, template, timeout = 10, error = True, region = None, y_anchor = None, y_slop = 200, threshold = 0.8):
         start = time.time()
+        best_score, best_frame, best_region = None, None, None
         while time.time() - start < timeout:
             self._check_stop()
             frame = self.window.screenshot()
@@ -1894,13 +1932,22 @@ OCR is limited to the right half of the window unless ``region`` is passed expli
             if self._battle_rewards.handle(frame):
                 continue
             search_region = self._search_region_for_template(frame, template, region, y_anchor, y_slop)
-            (x, y) = self.vision.find_template(frame, template, threshold = threshold, region = search_region)
+            if template == 'attack.png':
+                (x, y, score) = self.vision.find_template_with_confidence(
+                    frame, template, threshold = threshold, region = search_region)
+                if best_score is None or score > best_score:
+                    best_score, best_frame, best_region = score, frame, search_region
+            else:
+                (x, y) = self.vision.find_template(frame, template, threshold = threshold, region = search_region)
             if x:
                 return (x, y)
             if self.stop_event.wait(0.5):
                 return (None, None)
         if error:
             logger.warning(f'''Timeout waiting for {template}''')
+            if template == 'attack.png':
+                self.vision.log_template_diagnostics(
+                    best_frame, template, region = best_region, best_score = best_score)
         return (None, None)
 
 

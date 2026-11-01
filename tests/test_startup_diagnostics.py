@@ -64,8 +64,8 @@ class StartupTests(unittest.TestCase):
     def test_three_failed_attempts_log_each_portrait_once(self):
         self.bot.vision.find_template.return_value = (None, None)
         self.bot._ensure_correct_village(False)
-        # Three portraits on each of the three attempts, threshold still defaults to 0.8.
-        self.assertEqual(self.bot.vision.find_template.call_count, 9)
+        # Three portraits plus the Attack fallback on each attempt, threshold unchanged.
+        self.assertEqual(self.bot.vision.find_template.call_count, 12)
         calls = self.bot.vision.log_template_diagnostics.call_args_list
         self.assertEqual([c.args[1] for c in calls],
                          ['mbuilder.png', 'builder.png', 'gbuilder.png'])
@@ -84,6 +84,68 @@ class StartupTests(unittest.TestCase):
         self.bot._ensure_correct_village(False)
         self.bot._detect_village_type.assert_called_once()
         self.bot.vision.log_template_diagnostics.assert_not_called()
+
+    def test_detection_builder_returns_home_without_attack_fallback(self):
+        self.bot.vision.find_template.side_effect = (
+            lambda frame, name, **kw: (900, 50) if name == 'builder.png' else (None, None))
+        self.assertEqual(self.bot._detect_village_type(), 'home')
+        self.assertEqual([c.args[1] for c in self.bot.vision.find_template.call_args_list],
+                         ['mbuilder.png', 'builder.png'])
+
+    def test_detection_goblin_builder_returns_home_without_attack_fallback(self):
+        self.bot.vision.find_template.side_effect = (
+            lambda frame, name, **kw: (900, 50) if name == 'gbuilder.png' else (None, None))
+        self.assertEqual(self.bot._detect_village_type(), 'home')
+        self.assertEqual([c.args[1] for c in self.bot.vision.find_template.call_args_list],
+                         ['mbuilder.png', 'builder.png', 'gbuilder.png'])
+
+    def test_detection_master_builder_keeps_builder_base_priority(self):
+        self.bot.vision.find_template.return_value = (900, 50)
+        self.assertEqual(self.bot._detect_village_type(), 'builder')
+        self.assertEqual(self.bot.vision.find_template.call_count, 1)
+        self.assertEqual(self.bot.vision.find_template.call_args.args[1], 'mbuilder.png')
+
+    def test_detection_attack_fallback_returns_home_and_logs_once(self):
+        self.bot.vision.find_template.side_effect = (
+            lambda frame, name, **kw: (100, 950) if name == 'attack.png' else (None, None))
+        with self.assertLogs('BotCore', level='INFO') as logs:
+            self.assertEqual(self.bot._detect_village_type(), 'home')
+        self.assertEqual(logs.output, ['INFO:BotCore:Startup: Home Village confirmed via attack button'])
+        self.assertEqual([c.args[1] for c in self.bot.vision.find_template.call_args_list],
+                         ['mbuilder.png', 'builder.png', 'gbuilder.png', 'attack.png'])
+        self.assertEqual(self.bot.vision.find_template.call_args.kwargs,
+                         {'threshold': .8, 'region': (0, 540, 1920, 540)})
+        self.bot.input.click.assert_not_called()
+
+    def test_detection_without_any_match_returns_unknown(self):
+        self.bot.vision.find_template.return_value = (None, None)
+        with patch('app.core.bot.logger') as logger:
+            self.assertIsNone(self.bot._detect_village_type())
+        self.assertEqual(self.bot.vision.find_template.call_count, 4)
+        logger.info.assert_not_called()
+
+    def test_detection_attack_uses_native_matching_in_bottom_half(self):
+        self.assertIn('attack.png', NATIVE_SCALE_TEMPLATES)
+        tile = np.random.default_rng(12).integers(0, 256, (84, 152, 3), dtype=np.uint8)
+
+        def match(frame, name, **kwargs):
+            if name == 'attack.png':
+                return VisionService.find_template(frame, name, **kwargs)
+            return (None, None)
+
+        self.bot.vision.find_template.side_effect = match
+        for top, expected in ((700, 'home'), (100, None)):
+            with self.subTest(top=top):
+                self.frame.fill(0)
+                self.frame[top:top+84, 100:252] = tile
+                with patch('app.services.vision.Config', return_value=self.bot.config), \
+                        patch('app.services.vision.get_template_path', return_value=Path('attack.png')), \
+                        patch('app.services.vision.cv2.imread', return_value=tile), \
+                        patch('app.services.vision.cv2.resize', wraps=cv2.resize) as resize, \
+                        patch('app.core.bot.logger'):
+                    self.assertEqual(self.bot._detect_village_type(), expected)
+                resize.assert_not_called()
+        self.bot.input.click.assert_not_called()
 
 
 class AttackTimeoutTests(unittest.TestCase):

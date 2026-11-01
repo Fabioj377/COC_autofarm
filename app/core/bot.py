@@ -1585,7 +1585,7 @@ Each iteration dismisses ``okay.png`` / ``exit.png`` if present, then village / 
 
     
     def _detect_village_type(self, frame = None):
-        '''Return ``"home"``, ``"builder"``, or ``None`` from top-half builder portraits.'''
+        '''Identify the village from portraits, then the bottom-half Attack button.'''
         if frame is None:
             frame = self.window.screenshot()
         self._village_detection_frame = frame
@@ -1598,6 +1598,11 @@ Each iteration dismisses ``okay.png`` / ``exit.png`` if present, then village / 
             return 'builder'
         (hx, hy) = self._find_home_village_builder(frame, top_roi)
         if hx:
+            return 'home'
+        (ax, ay) = self.vision.find_template(
+            frame, 'attack.png', threshold = 0.8, region = VisionService.bottom_half_region(frame))
+        if ax:
+            logger.info('Startup: Home Village confirmed via attack button')
             return 'home'
 
     
